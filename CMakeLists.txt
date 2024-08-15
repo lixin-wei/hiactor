@@ -124,7 +124,7 @@ if (NOT EXISTS ${Hiactor_BUILD_SEASTAR_SOURCE_DIR})
   execute_process (
     COMMAND git config --local user.name hiactor
     COMMAND git config --local user.email hiactor@alibaba-inc.com
-    COMMAND git am -q ${Hiactor_SOURCE_DIR}/seastar/patch/hiactor-hackings.patch
+    COMMAND git am -q ${Hiactor_SOURCE_DIR}/seastar/patch/hiactor-hackings.patch ${Hiactor_SOURCE_DIR}/seastar/patch/lixin-hack.patch
     WORKING_DIRECTORY ${Hiactor_BUILD_SEASTAR_SOURCE_DIR})
   if (Hiactor_COOK_DEPENDENCIES_ALL_STATIC)
     execute_process (

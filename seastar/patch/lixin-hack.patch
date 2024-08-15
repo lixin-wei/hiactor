@@ -1,0 +1,127 @@
+From ee8fa0abc1b4887086a212857e656e0e11a9aac3 Mon Sep 17 00:00:00 2001
+From: Lixin Wei <lixin.wei@metabit-trading.com>
+Date: Thu, 5 Sep 2024 23:32:30 +0800
+Subject: [PATCH] lixin's hack
+
+---
+ include/seastar/core/posix.hh | 12 ++++++++++++
+ src/core/reactor.cc           |  9 +++++++--
+ src/core/resource.cc          | 27 ++++++++++++++++++++++++---
+ 3 files changed, 43 insertions(+), 5 deletions(-)
+
+diff --git a/include/seastar/core/posix.hh b/include/seastar/core/posix.hh
+index f8dece37..c69b52f5 100644
+--- a/include/seastar/core/posix.hh
++++ b/include/seastar/core/posix.hh
+@@ -25,6 +25,7 @@
+ #include "abort_on_ebadf.hh"
+ #include <sys/types.h>
+ #include <sys/stat.h>
++#include <sys/sysinfo.h>
+ #include <unistd.h>
+ #include <assert.h>
+ #include <utility>
+@@ -487,6 +488,17 @@ void pin_this_thread(unsigned cpu_id) {
+     (void)r;
+ }
+ 
++inline
++void unpin_this_thread() {
++  cpu_set_t cpu_set;
++  CPU_ZERO(&cpu_set);
++  int cpu_count = get_nprocs_conf();
++  for (int i = 0; i < cpu_count; ++i) {
++    CPU_SET(i, &cpu_set);
++  }
++  pthread_setaffinity_np(pthread_self(), sizeof(cpu_set), &cpu_set);
++}
++
+ /// @}
+ 
+ }
+diff --git a/src/core/reactor.cc b/src/core/reactor.cc
+index 22dc21b1..fc57aabd 100644
+--- a/src/core/reactor.cc
++++ b/src/core/reactor.cc
+@@ -3557,6 +3557,7 @@ smp::get_options_description()
+         ("hugepages", bpo::value<std::string>(), "path to accessible hugetlbfs mount (typically /dev/hugepages/something)")
+         ("lock-memory", bpo::value<bool>(), "lock all memory (prevents swapping)")
+         ("thread-affinity", bpo::value<bool>()->default_value(true), "pin threads to their cpus (disable for overprovisioning)")
++        ("thread-affinity-exclude-list", bpo::value<std::vector<unsigned>>()->default_value({}), "don't pin these threads.")
+ #ifdef SEASTAR_HAVE_HWLOC
+         ("num-io-queues", bpo::value<unsigned>(), "Number of IO queues. Each IO unit will be responsible for a fraction of the IO requests. Defaults to the number of threads")
+         ("num-io-groups", bpo::value<unsigned>(), "Number of IO groups. Each IO group will be responsible for a fraction of the IO requests. Defaults to the number of NUMA nodes")
+@@ -4126,19 +4127,23 @@ void smp::configure(boost::program_options::variables_map configuration, reactor
+     _all_event_loops_done.emplace(smp::count);
+ 
+     auto backend_selector = configuration["reactor-backend"].as<reactor_backend_selector>();
++    auto thread_affinity_exclude_list = configuration["thread-affinity-exclude-list"].as<std::vector<unsigned>>();
++    std::unordered_set<unsigned> thread_affinity_exclude_set(thread_affinity_exclude_list.begin(), thread_affinity_exclude_list.end());
+ 
+     unsigned i;
+     auto smp_tmain = smp::_tmain;
+     for (i = 1; i < smp::count; i++) {
+         auto allocation = allocations[i];
+-        create_thread([this, smp_tmain, inited, &reactors_registered, &smp_queues_constructed, configuration, &reactors, hugepages_path, i, allocation, assign_io_queues, alloc_io_queues, thread_affinity, heapprof_enabled, mbind, backend_selector, reactor_cfg] {
++        create_thread([this, &thread_affinity_exclude_set, smp_tmain, inited, &reactors_registered, &smp_queues_constructed, configuration, &reactors, hugepages_path, i, allocation, assign_io_queues, alloc_io_queues, thread_affinity, heapprof_enabled, mbind, backend_selector, reactor_cfg] {
+           try {
+             // initialize thread_locals that are equal across all reacto threads of this smp instance
+             smp::_tmain = smp_tmain;
+             auto thread_name = seastar::format("reactor-{}", i);
+             pthread_setname_np(pthread_self(), thread_name.c_str());
+-            if (thread_affinity) {
++            if (thread_affinity && thread_affinity_exclude_set.count(i) == 0) {
+                 smp::pin(allocation.cpu_id);
++            } else {
++                unpin_this_thread();
+             }
+             memory::configure(allocation.mem, mbind, hugepages_path);
+             if (heapprof_enabled) {
+diff --git a/src/core/resource.cc b/src/core/resource.cc
+index a8f9796c..7f3dd6ee 100644
+--- a/src/core/resource.cc
++++ b/src/core/resource.cc
+@@ -347,6 +347,29 @@ struct distribute_objects {
+ #else
+         hwloc_distribute(topology, root, cpu_sets.data(), cpu_sets.size(), INT_MAX);
+ #endif
++
++        // hack by lixin: convert to round-robin style.
++        std::map<int, std::vector<hwloc_cpuset_t>> grouped_cpu_sets;
++        for (auto &cs : cpu_sets) {
++          auto cpu_id = hwloc_bitmap_first(cs);
++          assert(cpu_id != -1);
++          grouped_cpu_sets[cpu_id].push_back(cs);
++        }
++        size_t count = cpu_sets.size();
++        cpu_sets.clear();
++        auto iter = std::begin(grouped_cpu_sets);
++        while (count > 0) {
++          auto &vec = iter->second;
++          if (!vec.empty()) {
++            count--;
++            cpu_sets.push_back(vec.back());
++            vec.pop_back();
++          }
++          iter = std::next(iter);
++          if (iter == std::end(grouped_cpu_sets)) {
++            iter = std::begin(grouped_cpu_sets);
++          }
++        }
+     }
+ 
+     ~distribute_objects() {
+@@ -529,9 +552,7 @@ resources allocate(configuration& c) {
+                                               cgroup::memory_limit()));
+     unsigned available_procs = hwloc_get_nbobjs_by_type(topology, HWLOC_OBJ_PU);
+     unsigned procs = c.cpus.value_or(available_procs);
+-    if (procs > available_procs) {
+-        throw std::runtime_error("insufficient processing units");
+-    }
++
+     // limit memory address to fit in 36-bit, see core/memory.cc:Memory map
+     constexpr size_t max_mem_per_proc = 1UL << 36;
+     auto mem_per_proc = std::min(align_down<size_t>(mem / procs, 2 << 20), max_mem_per_proc);
+-- 
+2.43.0
+
